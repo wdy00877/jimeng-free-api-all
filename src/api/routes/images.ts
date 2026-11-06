@@ -3,8 +3,9 @@ import _ from "lodash";
 import Request from "@/lib/request/Request.ts";
 import APIException from "@/lib/exceptions/APIException.ts";
 import EX from "@/api/consts/exceptions.ts";
-import { DEFAULT_MODEL, generateImagesWithRetry } from "@/api/controllers/images.ts";
+import { DEFAULT_MODEL, extractImageUrls, generateImagesWithRetry, queryImageHistory } from "@/api/controllers/images.ts";
 import { markCredentialFailure, markCredentialSuccess, resolveAuthorization } from "@/api/controllers/auth.ts";
+import { logGenerationEvent } from "@/lib/generation-log.ts";
 import util from "@/lib/util.ts";
 import db from "@/lib/database.ts";
 
@@ -38,6 +39,59 @@ function collectReferenceImagePaths(bodyFilePath: any, bodyFilePaths: any, files
 
 export default {
   prefix: "/v1/images",
+
+  get: {
+    // 恢复查询：生图超时后，凭提交时返回的 history_record_id 查上游任务现状。
+    // 用法：GET /v1/images/generations/query?history_id=<id>（需带鉴权）
+    // 返回：{history_record_id, status, status_text, fail_code, image_urls}
+    //   status_text: processing（还在跑）/ succeeded（有图）/ failed（上游失败）/ not_found（查无此记录）
+    "/generations/query": async (request: Request) => {
+      request.validate("headers.authorization", _.isString);
+      const historyId = String(request.query.history_id || "").trim();
+      if (!historyId) {
+        throw new APIException(
+          EX.API_REQUEST_PARAMS_INVALID,
+          "缺少 history_id 参数：GET /v1/images/generations/query?history_id=<上游任务记录ID>"
+        );
+      }
+      const credential = await resolveAuthorization(request.headers.authorization);
+      const result = await queryImageHistory(historyId, credential.token);
+      const queryId = util.uuid();
+      if (!result) {
+        logGenerationEvent({
+          event: "query",
+          request_id: queryId,
+          history_id: historyId,
+          error: "record not found",
+        });
+        return {
+          history_record_id: historyId,
+          status: -1,
+          status_text: "not_found",
+          fail_code: null,
+          image_urls: [],
+        };
+      }
+      const done =
+        result.status === 50 || result.status === 21 || result.itemList.length > 0;
+      const failed = result.status === 30;
+      logGenerationEvent({
+        event: "query",
+        request_id: queryId,
+        history_id: historyId,
+        upstream_status: result.status,
+        fail_code: result.failCode || null,
+        result_count: done ? result.itemList.length : 0,
+      });
+      return {
+        history_record_id: historyId,
+        status: result.status,
+        status_text: done ? "succeeded" : failed ? "failed" : "processing",
+        fail_code: result.failCode || null,
+        image_urls: done ? extractImageUrls(result.itemList, 8) : [],
+      };
+    },
+  },
 
   post: {
     "/generations": async (request: Request) => {

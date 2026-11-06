@@ -1,3 +1,8 @@
+import fs from "fs-extra";
+import path from "path";
+
+import APIException from "@/lib/exceptions/APIException.ts";
+import EX from "@/api/consts/exceptions.ts";
 import logger from "@/lib/logger.ts";
 import util from "@/lib/util.ts";
 import { request } from "./core.ts";
@@ -19,7 +24,7 @@ export interface JimengModelConfig {
   supportsLongDuration?: boolean;
   defaultDuration?: number;
   supportedDurations?: number[];
-  source?: "static" | "dynamic";
+  source?: "static" | "dynamic" | "custom";
   raw?: any;
 }
 
@@ -31,6 +36,7 @@ const SEEDANCE_2_DURATIONS = [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 const IMAGE_REQ_KEY_IDS: Record<string, string> = {
   high_aes_general_v50p_large: "jimeng-image-5.0-pro",
   high_aes_general_v50: "jimeng-image-5.0-lite",
+  high_aes_general_v50_flash: "jimeng-image-5.0-flash",
   high_aes_general_v43: "jimeng-image-4.7",
   high_aes_general_v42: "jimeng-image-4.6",
   high_aes_general_v40l: "jimeng-image-4.5",
@@ -77,6 +83,17 @@ const STATIC_IMAGE_MODELS: JimengModelConfig[] = [
     defaultResolution: "2k",
     supportedResolutions: ["4k", "2k"],
     benefitCountByResolution: { "2k": 3, "4k": 1 },
+    source: "static",
+  },
+  {
+    id: "jimeng-image-5.0-flash",
+    type: "image",
+    name: "Seedream 5.0 Flash",
+    description: "Jimeng image generation model 5.0 Flash (lightweight 5.0 Pro, faster and cheaper)",
+    modelReqKey: "high_aes_general_v50_flash",
+    defaultResolution: "2k",
+    supportedResolutions: ["2k", "1.5k"],
+    // 积分消耗未在官网公开，暂不写 benefitCountByResolution，调用时按上游实际扣减为准
     source: "static",
   },
   {
@@ -368,10 +385,133 @@ function cloneModelConfig(model: JimengModelConfig): JimengModelConfig {
 }
 
 export function getStaticModelConfigs(type?: JimengModelType) {
-  const models = [...STATIC_IMAGE_MODELS, ...STATIC_VIDEO_MODELS];
-  return models
-    .filter((model) => !type || model.type === type)
-    .map(cloneModelConfig);
+  const merged = new Map<string, JimengModelConfig>();
+  for (const model of [...STATIC_IMAGE_MODELS, ...STATIC_VIDEO_MODELS]) {
+    merged.set(`${model.type}:${model.id}`, cloneModelConfig(model));
+  }
+  // 自定义模型（configs/models.json / JIMENG_EXTRA_MODELS）：同 id 或同
+  // modelReqKey 时覆盖内置模型，让运营方不用改代码就能加新模型
+  for (const model of getCustomModelConfigs()) {
+    for (const key of [...merged.keys()]) {
+      const existing = merged.get(key)!;
+      if (
+        existing.id === model.id ||
+        (existing.type === model.type && existing.modelReqKey === model.modelReqKey)
+      ) {
+        merged.delete(key);
+      }
+    }
+    merged.set(`${model.type}:${model.id}`, cloneModelConfig(model));
+  }
+  return [...merged.values()].filter((model) => !type || model.type === type);
+}
+
+/**
+ * 自定义模型配置：两处来源，合并后生效。
+ *
+ * 1) configs/models.json（文件，改完需重启服务）
+ *    {"images": [{"id", "name", "modelReqKey", "supportedResolutions": [...],
+ *                  "defaultResolution", "description", "enabled"}], "videos": [...]}
+ * 2) JIMENG_EXTRA_MODELS 环境变量（同样结构的 JSON 字符串；同 id 时覆盖文件）
+ *
+ * modelReqKey 是即梦网页端真正的内部模型标识（例如 high_aes_general_v50_flash），
+ * 可从即梦官网 F12 网络请求的 /mweb/v1/get_common_config 返回里找，或调本服务
+ * GET /v1/models?refresh=true（需带有效鉴权）看动态列表的 model_req_key 字段。
+ * enabled=false 或缺 modelReqKey 的条目会被跳过并记一条警告。
+ */
+const CUSTOM_MODELS_FILE = path.resolve("configs/models.json");
+
+interface CustomModelEntry {
+  id?: string;
+  type?: JimengModelType;
+  name?: string;
+  description?: string;
+  modelReqKey?: string;
+  aliases?: string[];
+  defaultResolution?: string;
+  supportedResolutions?: string[];
+  benefitCountByResolution?: Record<string, number>;
+  enabled?: boolean;
+}
+
+function normalizeCustomModel(entry: CustomModelEntry, origin: string): JimengModelConfig | null {
+  if (!entry || typeof entry !== "object") return null;
+  if (entry.enabled === false) return null;
+  if (typeof entry.id !== "string" || !entry.id.trim()) {
+    logger.warn(`[模型配置] ${origin} 中有模型缺少 id，已跳过`);
+    return null;
+  }
+  if (typeof entry.modelReqKey !== "string" || !entry.modelReqKey.trim()) {
+    logger.warn(`[模型配置] ${origin} 中的模型 ${entry.id} 没有 modelReqKey，已跳过（先确认即梦网页端的 model_req_key 再填）`);
+    return null;
+  }
+  const type: JimengModelType = entry.type === "video" ? "video" : "image";
+  const supportedResolutions = (
+    entry.supportedResolutions?.length ? entry.supportedResolutions : ["2k"]
+  ).map((resolution) => String(resolution).toLowerCase());
+  return {
+    id: entry.id.trim(),
+    type,
+    name: entry.name || entry.id.trim(),
+    description: entry.description || `Custom Jimeng ${type} model ${entry.id}`,
+    modelReqKey: entry.modelReqKey.trim(),
+    aliases: entry.aliases,
+    defaultResolution: entry.defaultResolution || supportedResolutions[0],
+    supportedResolutions,
+    benefitCountByResolution: entry.benefitCountByResolution,
+    source: "custom",
+  };
+}
+
+function loadCustomModelConfigs(): JimengModelConfig[] {
+  const models: JimengModelConfig[] = [];
+  try {
+    if (fs.pathExistsSync(CUSTOM_MODELS_FILE)) {
+      const data = JSON.parse(fs.readFileSync(CUSTOM_MODELS_FILE).toString());
+      const entries: CustomModelEntry[] = [
+        ...((data.images || []) as CustomModelEntry[]),
+        ...((data.videos || []) as CustomModelEntry[]),
+      ];
+      for (const entry of entries) {
+        const model = normalizeCustomModel(entry, "configs/models.json");
+        if (model) models.push(model);
+      }
+      if (models.length > 0) {
+        logger.info(`[模型配置] 从 configs/models.json 加载 ${models.length} 个自定义模型`);
+      }
+    }
+  } catch (error) {
+    logger.warn(`[模型配置] configs/models.json 解析失败，已忽略：${error.message}`);
+  }
+  const envRaw = process.env.JIMENG_EXTRA_MODELS;
+  if (envRaw) {
+    try {
+      const data = JSON.parse(envRaw);
+      const entries: CustomModelEntry[] = [
+        ...((data.images || []) as CustomModelEntry[]),
+        ...((data.videos || []) as CustomModelEntry[]),
+      ];
+      for (const entry of entries) {
+        const model = normalizeCustomModel(entry, "JIMENG_EXTRA_MODELS");
+        if (!model) continue;
+        const index = models.findIndex(
+          (item) => item.id === model.id || item.modelReqKey === model.modelReqKey
+        );
+        if (index >= 0) models[index] = model;
+        else models.push(model);
+      }
+    } catch (error) {
+      logger.warn(`[模型配置] JIMENG_EXTRA_MODELS 解析失败，已忽略：${error.message}`);
+    }
+  }
+  return models;
+}
+
+let customModelCache: JimengModelConfig[] | null = null;
+
+function getCustomModelConfigs(): JimengModelConfig[] {
+  if (!customModelCache) customModelCache = loadCustomModelConfigs();
+  return customModelCache.map(cloneModelConfig);
 }
 
 function getStaticModelConfig(modelIdOrReqKey: string, type?: JimengModelType) {
@@ -773,18 +913,23 @@ export async function resolveModelConfig(
 ) {
   const models = await listModelConfigs(refreshToken, { type });
   const matched = models.find(
-      (model) =>
-        model.id === modelIdOrReqKey ||
-        model.modelReqKey === modelIdOrReqKey ||
-        model.aliases?.includes(modelIdOrReqKey)
+    (model) =>
+      model.id === modelIdOrReqKey ||
+      model.modelReqKey === modelIdOrReqKey ||
+      model.aliases?.includes(modelIdOrReqKey)
   );
   if (matched) return matched;
   const staticMatch = getStaticModelConfig(modelIdOrReqKey, type);
   if (staticMatch) return staticMatch;
-  return getStaticModelConfig(
-    type === "image" ? "jimeng-image-5.0-lite" : "jimeng-video-seedance-2.0",
-    type
-  )!;
+  // 不再静默回落到默认模型：以前传一个不存在的模型名（例如客户端下拉里
+  // 的 Seedream 5.0 Aurora）会悄悄按 5.0 Lite 出图、按 Lite 扣积分，
+  // 用户完全察觉不到用错了模型。现在直接报“不支持的模型”，并列出可用模型。
+  throw new APIException(
+    EX.API_REQUEST_PARAMS_INVALID,
+    `不支持的模型: ${modelIdOrReqKey}，可用模型请查询 /v1/models（当前可用：${models
+      .map((model) => model.id)
+      .join(", ")}）`
+  );
 }
 
 export function getStaticModelReqKey(

@@ -8,6 +8,7 @@ export default {
     API_CHAT_STREAM_PUSHING: [-2005, '已有对话流正在输出'],
     API_CONTENT_FILTERED: [-2006, '内容由于合规问题已被阻止生成'],
     API_IMAGE_GENERATION_FAILED: [-2007, '图像生成失败'],
+    API_IMAGE_GENERATION_TIMEOUT: [-2011, '图像生成超时，上游任务可能已扣积分，可凭记录ID查询结果'],
     API_VIDEO_GENERATION_FAILED: [-2008, '视频生成失败'],
     API_IMAGE_GENERATION_INSUFFICIENT_POINTS: [-2009, '即梦积分不足'],
     API_RISK_CONTROL_REJECTED: [-2010, '请求被上游风控拦截'],

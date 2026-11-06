@@ -5,11 +5,23 @@ import EX from "@/api/consts/exceptions.ts";
 import util from "@/lib/util.ts";
 import { getCredit, receiveCredit, request, uploadFile } from "./core.ts";
 import logger from "@/lib/logger.ts";
+import { logGenerationEvent, sanitizeForLog } from "@/lib/generation-log.ts";
 import { JimengModelConfig, resolveImageModelConfig } from "./models.ts";
 
 const DEFAULT_ASSISTANT_ID = 513695;
 export const DEFAULT_MODEL = "jimeng-image-5.0-lite";
 const DRAFT_VERSION = "3.3.20";
+// 生图轮询超时配置（均可用环境变量覆盖，改完需重启服务）：
+// JIMENG_IMAGE_POLL_TIMEOUT_MS          主轮询总时长上限，默认 120000（120 秒，与旧版 120 次轮询等价）
+// JIMENG_IMAGE_POLL_INTERVAL_MS         每次状态查询间隔，默认 1000
+// JIMENG_IMAGE_POLL_GRACE_ATTEMPTS      主轮询超时后的宽限查询次数，默认 6（任务可能刚好完成）
+// JIMENG_IMAGE_POLL_MAX_CONSECUTIVE_ERRORS  连续查询失败多少次后放弃等待，默认 5
+const POLL_TIMEOUT_MS = Number(process.env.JIMENG_IMAGE_POLL_TIMEOUT_MS || 120_000);
+const POLL_INTERVAL_MS = Number(process.env.JIMENG_IMAGE_POLL_INTERVAL_MS || 1000);
+const POLL_GRACE_ATTEMPTS = Number(process.env.JIMENG_IMAGE_POLL_GRACE_ATTEMPTS || 6);
+const POLL_MAX_CONSECUTIVE_ERRORS = Number(
+  process.env.JIMENG_IMAGE_POLL_MAX_CONSECUTIVE_ERRORS || 5
+);
 // Draft content version matching the official web client payload (the
 // request-level da_version stays 3.3.20). The payload is kept field-for-field
 // aligned with what jimeng.jianying.com sends; the decisive field is
@@ -21,6 +33,7 @@ const MIN_VERSION = "3.0.2";
 const MODEL_MAP = {
   "jimeng-image-5.0-pro": "high_aes_general_v50p_large",
   "jimeng-image-5.0-lite": "high_aes_general_v50",
+  "jimeng-image-5.0-flash": "high_aes_general_v50_flash",
   "jimeng-image-4.7": "high_aes_general_v43",
   "jimeng-image-4.6": "high_aes_general_v42",
   "jimeng-image-4.5": "high_aes_general_v40l",
@@ -35,6 +48,7 @@ function isHighResImageModel(modelName: string, modelConfig?: JimengModelConfig)
   if (modelConfig) return modelConfig.supportedResolutions.includes("2k");
   return [
     "jimeng-image-5.0-lite",
+    "jimeng-image-5.0-flash",
     "jimeng-image-4.7",
     "jimeng-image-4.6",
     "jimeng-image-4.5",
@@ -46,6 +60,7 @@ function isHighResImageModel(modelName: string, modelConfig?: JimengModelConfig)
 function getImageResolutionLevels(modelName: string) {
   if (modelName === "jimeng-image-2.0-pro") return ["1k"];
   if (modelName === "jimeng-image-5.0-pro") return ["4k", "2k", "1.5k"];
+  if (modelName === "jimeng-image-5.0-flash") return ["2k", "1.5k"];
   if (isHighResImageModel(modelName)) return ["4k", "2k"];
   return ["1k"];
 }
@@ -177,6 +192,289 @@ function detectAspectRatioKey(prompt: string): string | null {
   return null;
 }
 
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * 查询一次上游任务状态（get_history_by_ids）。
+ * 返回 null 表示上游查不到这条记录；其它情况返回 {status, failCode, itemList}。
+ * 供轮询和恢复查询接口共用。
+ */
+export async function queryImageHistory(
+  historyId: string,
+  refreshToken: string
+): Promise<{ status: number; failCode?: string; itemList: any[] } | null> {
+  const result = await request(
+    "post",
+    "/mweb/v1/get_history_by_ids",
+    refreshToken,
+    {
+      data: {
+        history_ids: [historyId],
+        image_info: {
+          width: 2048,
+          height: 2048,
+          format: "webp",
+          image_scene_list: [
+            {
+              scene: "smart_crop",
+              width: 360,
+              height: 360,
+              uniq_key: "smart_crop-w:360-h:360",
+              format: "webp",
+            },
+            {
+              scene: "smart_crop",
+              width: 480,
+              height: 480,
+              uniq_key: "smart_crop-w:480-h:480",
+              format: "webp",
+            },
+            {
+              scene: "smart_crop",
+              width: 720,
+              height: 720,
+              uniq_key: "smart_crop-w:720-h:720",
+              format: "webp",
+            },
+            {
+              scene: "smart_crop",
+              width: 720,
+              height: 480,
+              uniq_key: "smart_crop-w:720-h:480",
+              format: "webp",
+            },
+            {
+              scene: "smart_crop",
+              width: 360,
+              height: 240,
+              uniq_key: "smart_crop-w:360-h:240",
+              format: "webp",
+            },
+            {
+              scene: "smart_crop",
+              width: 240,
+              height: 320,
+              uniq_key: "smart_crop-w:240-h:320",
+              format: "webp",
+            },
+            {
+              scene: "smart_crop",
+              width: 480,
+              height: 640,
+              uniq_key: "smart_crop-w:480-h:640",
+              format: "webp",
+            },
+            {
+              scene: "normal",
+              width: 2400,
+              height: 2400,
+              uniq_key: "2400",
+              format: "webp",
+            },
+            {
+              scene: "normal",
+              width: 1080,
+              height: 1080,
+              uniq_key: "1080",
+              format: "webp",
+            },
+            {
+              scene: "normal",
+              width: 720,
+              height: 720,
+              uniq_key: "720",
+              format: "webp",
+            },
+            {
+              scene: "normal",
+              width: 480,
+              height: 480,
+              uniq_key: "480",
+              format: "webp",
+            },
+            {
+              scene: "normal",
+              width: 360,
+              height: 360,
+              uniq_key: "360",
+              format: "webp",
+            },
+          ],
+        },
+        http_common_info: {
+          aid: Number(DEFAULT_ASSISTANT_ID),
+        },
+      },
+    }
+  );
+  if (!result[historyId]) return null;
+  return {
+    status: result[historyId].status,
+    failCode: result[historyId].fail_code,
+    itemList: result[historyId].item_list || [],
+  };
+}
+
+export function extractImageUrls(itemList: any[], n: number): (string | null)[] {
+  return itemList
+    .map((item) => {
+      if (!item?.image?.large_images?.[0]?.image_url)
+        return item?.common_attr?.cover_url || null;
+      return item.image.large_images[0].image_url;
+    })
+    .slice(0, n);
+}
+
+/** 尽力而为查一次积分，失败返回 null（绝不能影响主流程）。 */
+async function fetchCreditsSafe(refreshToken: string): Promise<number | null> {
+  try {
+    const { totalCredit } = await getCredit(refreshToken);
+    return totalCredit;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 轮询上游任务直到完成/失败，或达到超时上限。
+ *
+ * 与旧版的区别（旧版的问题）：
+ * 1. 旧版单次轮询请求抛错（网络抖动/上游 45 秒超时）会直接炸掉整个生成，
+ *    即使上游任务还在跑；现在单次查询失败只记一条 poll_error 日志并继续等，
+ *    连续失败达到上限才放弃。
+ * 2. 旧版 120 次轮询一到就抛“图像生成超时”，history_record_id 直接丢弃，
+ *    上游任务即使随后完成、积分已扣，用户也永远拿不到图；现在超时后先做
+ *    POLL_GRACE_ATTEMPTS 次宽限查询，仍无结果才抛超时错误，且错误里带上
+ *    history_record_id，可用恢复查询接口随后取回结果。
+ * 3. 超时后绝不重新提交：重新提交会在上游新建任务、再次扣积分。
+ */
+async function pollImageHistory(
+  historyId: string,
+  refreshToken: string,
+  ctx: {
+    requestId: string;
+    modelName: string;
+    modelReqKey: string;
+    creditsBefore: number | null;
+    startedAt: number;
+  }
+): Promise<{ status: number; failCode?: string; itemList: any[] }> {
+  // 状态码说明：
+  // 20 = 初始提交/队列中
+  // 42 = 处理中（jimeng-4.5 新状态）
+  // 45 = 处理中（jimeng-4.5 中间状态）
+  // 50 = 完成/有结果（jimeng-4.5）
+  // 21 = 生成成功（旧版本）
+  // 30 = 生成失败
+  const PROCESSING_STATES = [20, 42, 45];
+  const deadline = Date.now() + POLL_TIMEOUT_MS;
+  let status = 20;
+  let failCode: string | undefined;
+  let itemList: any[] = [];
+  let everSeen = false;
+  let consecutiveErrors = 0;
+  let polls = 0;
+
+  while (Date.now() < deadline) {
+    await sleep(POLL_INTERVAL_MS);
+    polls++;
+    let result: Awaited<ReturnType<typeof queryImageHistory>>;
+    try {
+      result = await queryImageHistory(historyId, refreshToken);
+    } catch (error) {
+      consecutiveErrors++;
+      logGenerationEvent({
+        event: "poll_error",
+        request_id: ctx.requestId,
+        model: ctx.modelName,
+        model_req_key: ctx.modelReqKey,
+        history_id: historyId,
+        elapsed_ms: Date.now() - ctx.startedAt,
+        upstream_status: status,
+        error: error.message,
+      });
+      logger.warn(
+        `⏳ [轮询] 第${polls}次查询失败（连续${consecutiveErrors}次）：${error.message}，继续等待上游任务`
+      );
+      if (consecutiveErrors >= POLL_MAX_CONSECUTIVE_ERRORS) break;
+      continue;
+    }
+    consecutiveErrors = 0;
+    if (!result) {
+      consecutiveErrors++;
+      logger.warn(`⏳ [轮询] 第${polls}次查询：上游记录暂不可见，继续等待`);
+      if (consecutiveErrors >= POLL_MAX_CONSECUTIVE_ERRORS) break;
+      continue;
+    }
+    everSeen = true;
+    status = result.status;
+    failCode = result.failCode;
+    itemList = result.itemList;
+    if (polls % 5 === 0 || itemList?.length > 0) {
+      logger.info(`⏳ [轮询] 第${polls}次 | 状态码: ${status} | 结果数: ${itemList?.length || 0}`);
+    }
+    if (!PROCESSING_STATES.includes(status) || (itemList && itemList.length > 0)) break;
+  }
+
+  // 宽限期：主轮询超时后不立刻丢弃，再查几次（任务可能刚好完成）
+  if (PROCESSING_STATES.includes(status) && (!itemList || itemList.length === 0)) {
+    for (let grace = 1; grace <= POLL_GRACE_ATTEMPTS; grace++) {
+      await sleep(POLL_INTERVAL_MS);
+      try {
+        const result = await queryImageHistory(historyId, refreshToken);
+        if (!result) continue;
+        everSeen = true;
+        status = result.status;
+        failCode = result.failCode;
+        itemList = result.itemList;
+        logger.info(
+          `⏳ [宽限查询] 第${grace}/${POLL_GRACE_ATTEMPTS}次 | 状态码: ${status} | 结果数: ${itemList?.length || 0}`
+        );
+        if (!PROCESSING_STATES.includes(status) || (itemList && itemList.length > 0)) break;
+      } catch (error) {
+        logger.warn(`⏳ [宽限查询] 第${grace}次失败：${error.message}`);
+      }
+    }
+  }
+
+  if (!everSeen) {
+    throw new APIException(EX.API_IMAGE_GENERATION_FAILED, "记录不存在");
+  }
+
+  if (PROCESSING_STATES.includes(status) && (!itemList || itemList.length === 0)) {
+    const elapsedMs = Date.now() - ctx.startedAt;
+    const creditsAfter = await fetchCreditsSafe(refreshToken);
+    logGenerationEvent({
+      event: "timeout",
+      request_id: ctx.requestId,
+      model: ctx.modelName,
+      model_req_key: ctx.modelReqKey,
+      history_id: historyId,
+      elapsed_ms: elapsedMs,
+      upstream_status: status,
+      credits_before: ctx.creditsBefore,
+      credits_after: creditsAfter,
+      error: "poll timeout",
+    });
+    throw new APIException(
+      EX.API_IMAGE_GENERATION_TIMEOUT,
+      `图像生成超时（已等待 ${Math.round(elapsedMs / 1000)} 秒）：上游任务 ${historyId} 仍在处理中，即梦可能已扣积分。请稍后凭记录ID查询结果：GET /v1/images/generations/query?history_id=${historyId}；不要重复提交，否则会再次扣积分`
+    ).setData({
+      history_record_id: historyId,
+      model: ctx.modelName,
+      model_req_key: ctx.modelReqKey,
+      elapsed_ms: elapsedMs,
+      upstream_status: status,
+      credits_before: ctx.creditsBefore,
+      credits_after: creditsAfter,
+    });
+  }
+
+  return { status, failCode, itemList };
+}
+
 export function getModel(model: string) {
   return MODEL_MAP[model] || MODEL_MAP[DEFAULT_MODEL];
 }
@@ -203,6 +501,17 @@ export async function generateImages(
   },
   refreshToken: string
 ) {
+  // 本次请求的唯一 ID + 计时起点：结构化日志用它把提交/轮询/超时/成功串起来
+  const requestId = util.uuid();
+  const startedAt = Date.now();
+  // 供 catch 记结构化失败日志用（在 try 外声明，避免 TDZ）
+  let modelReqKeyForLog: string | undefined;
+  let creditsBeforeForLog: number | null = null;
+  let historyId: string | null = null;
+  let lastStatus: number | null = null;
+  let lastFailCode: string | null = null;
+  let terminalLogged = false;
+  try {
   const referenceImagePaths = [...new Set(
     [filePath, ...filePaths].filter(
       (value): value is string => typeof value === "string" && value.trim().length > 0
@@ -236,6 +545,7 @@ export async function generateImages(
   const modelName = _model;
   const modelConfig = await resolveImageModelConfig(modelName, refreshToken);
   const model = modelConfig.modelReqKey || getModel(modelName);
+  modelReqKeyForLog = model;
 
   // 解析分辨率和比例
   let resolutionType = resolution.toLowerCase(); // 用户指定优先
@@ -294,6 +604,8 @@ export async function generateImages(
   logger.info(`═══════════════════════════════════════════════════════════\n`);
 
   const { totalCredit } = await getCredit(refreshToken);
+  const creditsBefore = totalCredit;
+  creditsBeforeForLog = creditsBefore;
   if (totalCredit <= 0) await receiveCredit(refreshToken);
 
   const componentId = util.uuid();
@@ -478,180 +790,111 @@ export async function generateImages(
     },
   };
   
-  // 输出完整请求数据用于调试
-  logger.info(`📤 [请求数据] ${JSON.stringify(requestData)}`);
+  // 完整请求数据只记 debug 级，且先脱敏；info 级只留结构化 [GEN] 事件，
+  // 避免日志里塞满大段 JSON
+  logger.debug(`📤 [请求数据] ${JSON.stringify(sanitizeForLog(requestData))}`);
 
-  const { aigc_data } = await request(
-    "post",
-    "/mweb/v1/aigc_draft/generate",
-    refreshToken,
-    {
-      params: {
-        da_version: DRAFT_VERSION,
-        web_component_open_flag: 1,
-        web_version: WEB_VERSION,
-      },
-      data: requestData,
-    }
-  );
-  const historyId = aigc_data.history_record_id;
-  if (!historyId)
-    throw new APIException(EX.API_IMAGE_GENERATION_FAILED, "记录ID不存在");
-
-  // 状态码说明：
-  // 20 = 初始提交/队列中
-  // 42 = 处理中（jimeng-4.5 新状态）
-  // 45 = 处理中（jimeng-4.5 中间状态）
-  // 50 = 完成/有结果（jimeng-4.5）
-  // 21 = 生成成功（旧版本）
-  // 30 = 生成失败
-  const PROCESSING_STATES = [20, 42, 45];
-  const FAIL_STATE = 30;
-
-  let status = 20,
-    failCode,
-    item_list = [];
-  let retryCount = 0;
-  const MAX_POLL_RETRIES = 120; // 最多轮询120次
-
-  while (
-    PROCESSING_STATES.includes(status) &&
-    (!item_list || item_list.length === 0) &&
-    retryCount < MAX_POLL_RETRIES
-  ) {
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-    retryCount++;
-    const result = await request(
+    const { aigc_data } = await request(
       "post",
-      "/mweb/v1/get_history_by_ids",
+      "/mweb/v1/aigc_draft/generate",
       refreshToken,
       {
-        data: {
-          history_ids: [historyId],
-          image_info: {
-            width: 2048,
-            height: 2048,
-            format: "webp",
-            image_scene_list: [
-              {
-                scene: "smart_crop",
-                width: 360,
-                height: 360,
-                uniq_key: "smart_crop-w:360-h:360",
-                format: "webp",
-              },
-              {
-                scene: "smart_crop",
-                width: 480,
-                height: 480,
-                uniq_key: "smart_crop-w:480-h:480",
-                format: "webp",
-              },
-              {
-                scene: "smart_crop",
-                width: 720,
-                height: 720,
-                uniq_key: "smart_crop-w:720-h:720",
-                format: "webp",
-              },
-              {
-                scene: "smart_crop",
-                width: 720,
-                height: 480,
-                uniq_key: "smart_crop-w:720-h:480",
-                format: "webp",
-              },
-              {
-                scene: "smart_crop",
-                width: 360,
-                height: 240,
-                uniq_key: "smart_crop-w:360-h:240",
-                format: "webp",
-              },
-              {
-                scene: "smart_crop",
-                width: 240,
-                height: 320,
-                uniq_key: "smart_crop-w:240-h:320",
-                format: "webp",
-              },
-              {
-                scene: "smart_crop",
-                width: 480,
-                height: 640,
-                uniq_key: "smart_crop-w:480-h:640",
-                format: "webp",
-              },
-              {
-                scene: "normal",
-                width: 2400,
-                height: 2400,
-                uniq_key: "2400",
-                format: "webp",
-              },
-              {
-                scene: "normal",
-                width: 1080,
-                height: 1080,
-                uniq_key: "1080",
-                format: "webp",
-              },
-              {
-                scene: "normal",
-                width: 720,
-                height: 720,
-                uniq_key: "720",
-                format: "webp",
-              },
-              {
-                scene: "normal",
-                width: 480,
-                height: 480,
-                uniq_key: "480",
-                format: "webp",
-              },
-              {
-                scene: "normal",
-                width: 360,
-                height: 360,
-                uniq_key: "360",
-                format: "webp",
-              },
-            ],
-          },
-          http_common_info: {
-            aid: Number(DEFAULT_ASSISTANT_ID),
-          },
+        params: {
+          da_version: DRAFT_VERSION,
+          web_component_open_flag: 1,
+          web_version: WEB_VERSION,
         },
+        data: requestData,
       }
     );
-    if (!result[historyId])
-      throw new APIException(EX.API_IMAGE_GENERATION_FAILED, "记录不存在");
-    status = result[historyId].status;
-    failCode = result[historyId].fail_code;
-    item_list = result[historyId].item_list;
-    // 每5次轮询输出一次状态，避免日志过多
-    if (retryCount % 5 === 0 || item_list?.length > 0) {
-      logger.info(`⏳ [轮询] 第${retryCount}次 | 状态码: ${status} | 结果数: ${item_list?.length || 0}`);
+    historyId = aigc_data.history_record_id;
+    if (!historyId)
+      throw new APIException(EX.API_IMAGE_GENERATION_FAILED, "记录ID不存在");
+
+    logGenerationEvent({
+      event: "submit",
+      request_id: requestId,
+      model: modelName,
+      model_req_key: model,
+      history_id: historyId,
+      elapsed_ms: Date.now() - startedAt,
+      credits_before: creditsBefore,
+      resolution: resolutionType,
+      ratio: validRatio,
+      n,
+    });
+
+    const { status, failCode, itemList } = await pollImageHistory(historyId, refreshToken, {
+      requestId,
+      modelName,
+      modelReqKey: model,
+      creditsBefore,
+      startedAt,
+    });
+    lastStatus = status;
+    lastFailCode = failCode || null;
+
+    // 状态码说明（见 pollImageHistory）：
+    // 20 排队 / 42、45 处理中 / 50、21 完成 / 30 失败
+    const FAIL_STATE = 30;
+    if (status === FAIL_STATE) {
+      const creditsAfter = await fetchCreditsSafe(refreshToken);
+      logGenerationEvent({
+        event: "failed",
+        request_id: requestId,
+        model: modelName,
+        model_req_key: model,
+        history_id: historyId,
+        elapsed_ms: Date.now() - startedAt,
+        upstream_status: status,
+        fail_code: failCode,
+        credits_before: creditsBefore,
+        credits_after: creditsAfter,
+        error: `upstream fail_code=${failCode}`,
+      });
+      terminalLogged = true;
+      if (failCode === "2038") throw new APIException(EX.API_CONTENT_FILTERED);
+      else throw new APIException(EX.API_IMAGE_GENERATION_FAILED);
     }
+    if (itemList.length > n) {
+      logger.warn(`⚠️ [生成张数] 请求 ${n} 张，上游实际返回 ${itemList.length} 张，请检查即梦积分消耗及请求数据`);
+    }
+    const urls = extractImageUrls(itemList, n);
+    const creditsAfter = await fetchCreditsSafe(refreshToken);
+    logGenerationEvent({
+      event: "success",
+      request_id: requestId,
+      model: modelName,
+      model_req_key: model,
+      history_id: historyId,
+      elapsed_ms: Date.now() - startedAt,
+      upstream_status: status,
+      credits_before: creditsBefore,
+      credits_after: creditsAfter,
+      result_count: urls.filter(Boolean).length,
+    });
+    return urls;
+  } catch (error) {
+    // 超时错误已在 pollImageHistory 内记过 timeout 事件；失败终态已在上面
+    // 记过 failed 事件；其余错误（提交失败等）在这里记一条 failed
+    const isTimeout =
+      error instanceof APIException && error.compare(EX.API_IMAGE_GENERATION_TIMEOUT);
+    if (!terminalLogged && !isTimeout) {
+      logGenerationEvent({
+        event: "failed",
+        request_id: requestId,
+        model: _model,
+        model_req_key: modelReqKeyForLog,
+        history_id: historyId,
+        elapsed_ms: Date.now() - startedAt,
+        upstream_status: lastStatus,
+        fail_code: lastFailCode,
+        credits_before: creditsBeforeForLog,
+        error: error.message,
+      });
+    }
+    throw error;
   }
-
-  if (retryCount >= MAX_POLL_RETRIES) {
-    throw new APIException(EX.API_IMAGE_GENERATION_FAILED, "图像生成超时");
-  }
-
-  if (status === FAIL_STATE) {
-    if (failCode === "2038") throw new APIException(EX.API_CONTENT_FILTERED);
-    else throw new APIException(EX.API_IMAGE_GENERATION_FAILED);
-  }
-  if (item_list.length > n) {
-    logger.warn(`⚠️ [生成张数] 请求 ${n} 张，上游实际返回 ${item_list.length} 张，请检查即梦积分消耗及请求数据`);
-  }
-  return item_list.map((item) => {
-    if (!item?.image?.large_images?.[0]?.image_url)
-      return item?.common_attr?.cover_url || null;
-    return item.image.large_images[0].image_url;
-  }).slice(0, n);
 }
 
 /**
@@ -672,7 +915,23 @@ export async function generateImagesWithRetry(
   },
   refreshToken: string
 ): Promise<string[]> {
-  const modelConfig = await resolveImageModelConfig(_model, refreshToken);
+  const retryRequestId = util.uuid();
+  const retryStartedAt = Date.now();
+  let modelConfig;
+  try {
+    modelConfig = await resolveImageModelConfig(_model, refreshToken);
+  } catch (error) {
+    // 模型名本身非法（例如客户端下拉里的 Aurora/Surge）：在进生成流程前就
+    // 报错，这里补一条结构化失败日志，否则这次调用在日志里完全没有痕迹
+    logGenerationEvent({
+      event: "failed",
+      request_id: retryRequestId,
+      model: _model,
+      elapsed_ms: Date.now() - retryStartedAt,
+      error: error.message,
+    });
+    throw error;
+  }
   const resolutionLevels = getImageResolutionFallbacks(
     _model,
     options.resolution,

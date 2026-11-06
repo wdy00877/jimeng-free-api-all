@@ -240,7 +240,7 @@ export async function request(
             url: fullUrl,
             params: requestParams,
             headers: headers,
-            timeout: 45000, // 增加超时时间到45秒
+            timeout: Number(process.env.JIMENG_REQUEST_TIMEOUT_MS || 45000), // 上游单次请求超时，可用环境变量覆盖
             validateStatus: () => true, // 允许任何状态码
             ..._.omit(options, "params", "headers"),
           });
