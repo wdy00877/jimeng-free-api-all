@@ -186,7 +186,13 @@ export async function request(
     `9e2c|${uri.slice(-7)}|${PLATFORM_CODE}|${VERSION_CODE}|${deviceTime}||11ac`
   );
 
-  const fullUrl = `https://jimeng.jianying.com${uri}`;
+  // 上游地址默认即梦官网；JIMENG_API_BASE_URL 仅供本地验证用（指向桩上游），
+  // 生产不要设置——设错会把所有请求打到错误地址。改完需重启服务。
+  const apiBaseUrl = (process.env.JIMENG_API_BASE_URL || "https://jimeng.jianying.com").replace(
+    /\/$/,
+    ""
+  );
+  const fullUrl = `${apiBaseUrl}${uri}`;
   const requestParams = {
     aid: DEFAULT_ASSISTANT_ID,
     device_platform: "web",

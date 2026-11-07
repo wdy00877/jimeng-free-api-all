@@ -6,6 +6,14 @@ import util from "@/lib/util.ts";
 import { getCredit, receiveCredit, request, uploadFile } from "./core.ts";
 import logger from "@/lib/logger.ts";
 import { logGenerationEvent, sanitizeForLog } from "@/lib/generation-log.ts";
+import {
+  computeImageFingerprint,
+  hashAccountToken,
+  hashReferenceInput,
+  imageJobManager,
+  type GenerationJob,
+  type JobOutcome,
+} from "@/lib/generation-jobs.ts";
 import { JimengModelConfig, resolveImageModelConfig } from "./models.ts";
 
 const DEFAULT_ASSISTANT_ID = 513695;
@@ -22,6 +30,81 @@ const POLL_GRACE_ATTEMPTS = Number(process.env.JIMENG_IMAGE_POLL_GRACE_ATTEMPTS 
 const POLL_MAX_CONSECUTIVE_ERRORS = Number(
   process.env.JIMENG_IMAGE_POLL_MAX_CONSECUTIVE_ERRORS || 5
 );
+// 后台完成总上限：提交后即使客户端 HTTP 连接断开（例如 Cherry Studio
+// 60 秒超时），后台轮询也继续到这个上限（默认 600 秒），结果进缓存；
+// 客户端重试同一请求时命中缓存，不再新建任务、不再重复扣积分。
+// 改完需重启服务；不要小于 JIMENG_IMAGE_POLL_TIMEOUT_MS。
+const BACKGROUND_TIMEOUT_MS = Number(
+  process.env.JIMENG_IMAGE_BACKGROUND_TIMEOUT_MS || 600_000
+);
+
+// 后台任务的生命周期事件 → 结构化 [GEN] 日志。
+// 全部事件（cache_hit / dedup_join / background_complete /
+// background_timeout / background_busy / cache_evict）都由管理器经 onEvent
+// 统一发，wrapper 不再重复记，避免同一事件出现两条日志。
+imageJobManager.onEvent = (event) => {
+  const fingerprint = event.fingerprint?.slice(0, 12);
+  switch (event.type) {
+    case "cache_hit":
+    case "dedup_join":
+      // 命中缓存 / 加入等待中的同一任务：由管理器统一记，避免 wrapper 重复记
+      logGenerationEvent({
+        event: event.type,
+        request_id: event.requestId || util.uuid(),
+        model: event.model,
+        model_req_key: event.modelReqKey,
+        history_id: event.historyId,
+        fingerprint,
+        elapsed_ms: event.elapsedMs,
+        result_count: event.resultCount,
+      });
+      break;
+    case "background_busy":
+      logGenerationEvent({
+        event: "background_busy",
+        request_id: event.requestId || util.uuid(),
+        model: event.model,
+        fingerprint,
+        error: "background job limit reached",
+      });
+      break;
+    case "background_complete":
+      logGenerationEvent({
+        event: "background_complete",
+        request_id: event.requestId || util.uuid(),
+        model: event.model,
+        model_req_key: event.modelReqKey,
+        history_id: event.historyId,
+        fingerprint,
+        elapsed_ms: event.elapsedMs,
+        upstream_status: event.upstreamStatus,
+        credits_before: event.creditsBefore,
+        credits_after: event.creditsAfter,
+        result_count: event.resultCount,
+      });
+      break;
+    case "background_timeout":
+      logGenerationEvent({
+        event: "background_timeout",
+        request_id: event.requestId || util.uuid(),
+        model: event.model,
+        model_req_key: event.modelReqKey,
+        history_id: event.historyId,
+        fingerprint,
+        elapsed_ms: event.elapsedMs,
+        upstream_status: event.upstreamStatus,
+        credits_before: event.creditsBefore,
+        credits_after: event.creditsAfter,
+        error: "background poll timeout",
+      });
+      break;
+    case "cache_evict":
+      logger.info(
+        `🗑️ [缓存] 淘汰指纹 ${event.fingerprint.slice(0, 12)}…（原因：${event.reason}）`
+      );
+      break;
+  }
+};
 // Draft content version matching the official web client payload (the
 // request-level da_version stays 3.3.20). The payload is kept field-for-field
 // aligned with what jimeng.jianying.com sends; the decisive field is
@@ -338,19 +421,24 @@ async function fetchCreditsSafe(refreshToken: string): Promise<number | null> {
 }
 
 /**
- * 轮询上游任务直到完成/失败，或达到超时上限。
+ * 轮询上游任务直到完成/失败，或达到给定的总时长上限。
  *
- * 与旧版的区别（旧版的问题）：
- * 1. 旧版单次轮询请求抛错（网络抖动/上游 45 秒超时）会直接炸掉整个生成，
- *    即使上游任务还在跑；现在单次查询失败只记一条 poll_error 日志并继续等，
- *    连续失败达到上限才放弃。
- * 2. 旧版 120 次轮询一到就抛“图像生成超时”，history_record_id 直接丢弃，
- *    上游任务即使随后完成、积分已扣，用户也永远拿不到图；现在超时后先做
- *    POLL_GRACE_ATTEMPTS 次宽限查询，仍无结果才抛超时错误，且错误里带上
- *    history_record_id，可用恢复查询接口随后取回结果。
- * 3. 超时后绝不重新提交：重新提交会在上游新建任务、再次扣积分。
+ * 与上一轮的区别：上一轮这个函数到时直接抛 -2011，调用方只能放弃；
+ * 现在它只返回结果对象，由调用方决定：前台等待（本次 HTTP）超时时返回
+ * -2011 但任务继续；后台跑满上限时记 background_timeout，historyId 保留
+ * 供下一次相同请求重新挂接。单次查询失败的容错逻辑保持不变（只记
+ * poll_error 并继续等，连续失败到上限才放弃；超时后先做宽限查询）。
  */
-async function pollImageHistory(
+export interface PollOutcome {
+  /** done=终态（成功/失败）或已有结果 timeout=到上限仍在处理 unseen=上游一直查不到记录 */
+  outcome: "done" | "timeout" | "unseen";
+  status: number;
+  failCode?: string;
+  itemList: any[];
+  polls: number;
+}
+
+async function pollImageHistoryUntil(
   historyId: string,
   refreshToken: string,
   ctx: {
@@ -359,8 +447,17 @@ async function pollImageHistory(
     modelReqKey: string;
     creditsBefore: number | null;
     startedAt: number;
+  },
+  opts: {
+    /** 本次轮询的总时长上限（毫秒） */
+    deadlineMs: number;
+    /** 查询函数（默认查上游；测试可注入桩函数） */
+    queryFn?: typeof queryImageHistory;
+    /** 每次查到新状态时回调（供调用方更新任务的 lastStatus） */
+    onStatus?: (status: number, resultCount: number) => void;
   }
-): Promise<{ status: number; failCode?: string; itemList: any[] }> {
+): Promise<PollOutcome> {
+  const query = opts.queryFn ?? queryImageHistory;
   // 状态码说明：
   // 20 = 初始提交/队列中
   // 42 = 处理中（jimeng-4.5 新状态）
@@ -369,7 +466,7 @@ async function pollImageHistory(
   // 21 = 生成成功（旧版本）
   // 30 = 生成失败
   const PROCESSING_STATES = [20, 42, 45];
-  const deadline = Date.now() + POLL_TIMEOUT_MS;
+  const deadline = Date.now() + opts.deadlineMs;
   let status = 20;
   let failCode: string | undefined;
   let itemList: any[] = [];
@@ -382,7 +479,7 @@ async function pollImageHistory(
     polls++;
     let result: Awaited<ReturnType<typeof queryImageHistory>>;
     try {
-      result = await queryImageHistory(historyId, refreshToken);
+      result = await query(historyId, refreshToken);
     } catch (error) {
       consecutiveErrors++;
       logGenerationEvent({
@@ -412,6 +509,7 @@ async function pollImageHistory(
     status = result.status;
     failCode = result.failCode;
     itemList = result.itemList;
+    opts.onStatus?.(status, itemList?.length || 0);
     if (polls % 5 === 0 || itemList?.length > 0) {
       logger.info(`⏳ [轮询] 第${polls}次 | 状态码: ${status} | 结果数: ${itemList?.length || 0}`);
     }
@@ -423,12 +521,13 @@ async function pollImageHistory(
     for (let grace = 1; grace <= POLL_GRACE_ATTEMPTS; grace++) {
       await sleep(POLL_INTERVAL_MS);
       try {
-        const result = await queryImageHistory(historyId, refreshToken);
+        const result = await query(historyId, refreshToken);
         if (!result) continue;
         everSeen = true;
         status = result.status;
         failCode = result.failCode;
         itemList = result.itemList;
+        opts.onStatus?.(status, itemList?.length || 0);
         logger.info(
           `⏳ [宽限查询] 第${grace}/${POLL_GRACE_ATTEMPTS}次 | 状态码: ${status} | 结果数: ${itemList?.length || 0}`
         );
@@ -440,39 +539,47 @@ async function pollImageHistory(
   }
 
   if (!everSeen) {
-    throw new APIException(EX.API_IMAGE_GENERATION_FAILED, "记录不存在");
+    return { outcome: "unseen", status, failCode, itemList, polls };
   }
-
   if (PROCESSING_STATES.includes(status) && (!itemList || itemList.length === 0)) {
-    const elapsedMs = Date.now() - ctx.startedAt;
-    const creditsAfter = await fetchCreditsSafe(refreshToken);
-    logGenerationEvent({
-      event: "timeout",
-      request_id: ctx.requestId,
-      model: ctx.modelName,
-      model_req_key: ctx.modelReqKey,
-      history_id: historyId,
-      elapsed_ms: elapsedMs,
-      upstream_status: status,
-      credits_before: ctx.creditsBefore,
-      credits_after: creditsAfter,
-      error: "poll timeout",
-    });
-    throw new APIException(
-      EX.API_IMAGE_GENERATION_TIMEOUT,
-      `图像生成超时（已等待 ${Math.round(elapsedMs / 1000)} 秒）：上游任务 ${historyId} 仍在处理中，即梦可能已扣积分。请稍后凭记录ID查询结果：GET /v1/images/generations/query?history_id=${historyId}；不要重复提交，否则会再次扣积分`
-    ).setData({
-      history_record_id: historyId,
-      model: ctx.modelName,
-      model_req_key: ctx.modelReqKey,
-      elapsed_ms: elapsedMs,
-      upstream_status: status,
-      credits_before: ctx.creditsBefore,
-      credits_after: creditsAfter,
-    });
+    return { outcome: "timeout", status, failCode, itemList, polls };
   }
+  return { outcome: "done", status, failCode, itemList, polls };
+}
 
-  return { status, failCode, itemList };
+/**
+ * 构造 -2011 超时错误（保留上一轮的错误码与 history_record_id）。
+ *
+ * 语义变了：以前是“任务丢了，只能凭 ID 自己查”；现在任务仍在后台跑，
+ * 客户端直接重试同一请求（相同模型/提示词/参数）即可命中缓存或加入等待，
+ * 不会新建任务、不重复扣积分；恢复查询接口仍保留给 API 用户兜底。
+ */
+function buildTimeoutError(opts: {
+  requestId: string;
+  modelName: string;
+  modelReqKey?: string;
+  historyId: string | null;
+  elapsedMs: number;
+  upstreamStatus?: number | null;
+  creditsBefore?: number | null;
+  creditsAfter?: number | null;
+}): APIException {
+  const seconds = Math.round(opts.elapsedMs / 1000);
+  const historyPart = opts.historyId
+    ? `上游任务 ${opts.historyId} 仍在后台继续处理，即梦可能已扣积分。请直接重试同一请求（相同模型/提示词/参数），反代会返回已完成的结果而不再重复扣积分；也可凭记录ID查询结果：GET /v1/images/generations/query?history_id=${opts.historyId}`
+    : `任务仍在后台继续处理，即梦可能已扣积分。请稍后重试同一请求（相同模型/提示词/参数），反代会返回已完成的结果而不再重复扣积分`;
+  return new APIException(
+    EX.API_IMAGE_GENERATION_TIMEOUT,
+    `图像生成超时（已等待 ${seconds} 秒）：${historyPart}。不要换参数重复提交，否则会新建任务再次扣积分`
+  ).setData({
+    history_record_id: opts.historyId,
+    model: opts.modelName,
+    model_req_key: opts.modelReqKey,
+    elapsed_ms: opts.elapsedMs,
+    upstream_status: opts.upstreamStatus ?? null,
+    credits_before: opts.creditsBefore ?? null,
+    credits_after: opts.creditsAfter ?? null,
+  });
 }
 
 export function getModel(model: string) {
@@ -499,7 +606,20 @@ export async function generateImages(
     filePaths?: string[]; // 参考图路径，支持本地/网络/base64
     n?: number; // 生成张数 (1-8)
   },
-  refreshToken: string
+  refreshToken: string,
+  opts?: {
+    /** 本次轮询的总时长上限（毫秒）。默认 120000（前台行为）；后台任务传 BACKGROUND_TIMEOUT_MS */
+    pollTimeoutMs?: number;
+    /** 上游提交成功后立即回调（让后台任务尽早拿到 historyId 供等待者用） */
+    onSubmitted?: (info: {
+      historyId: string;
+      creditsBefore: number | null;
+      modelReqKey: string;
+      modelName: string;
+    }) => void;
+    /** 每次查到新状态时回调（供后台任务更新 lastStatus） */
+    onStatus?: (status: number, resultCount: number) => void;
+  }
 ) {
   // 本次请求的唯一 ID + 计时起点：结构化日志用它把提交/轮询/超时/成功串起来
   const requestId = util.uuid();
@@ -811,6 +931,15 @@ export async function generateImages(
     if (!historyId)
       throw new APIException(EX.API_IMAGE_GENERATION_FAILED, "记录ID不存在");
 
+    // 提交成功立刻把 historyId 交给后台任务：哪怕这次 HTTP 请求随后超时，
+    // 等待者也能凭它拿到 -2011 里的记录 ID，重试时还能重新挂接。
+    opts?.onSubmitted?.({
+      historyId,
+      creditsBefore,
+      modelReqKey: model,
+      modelName,
+    });
+
     logGenerationEvent({
       event: "submit",
       request_id: requestId,
@@ -824,17 +953,47 @@ export async function generateImages(
       n,
     });
 
-    const { status, failCode, itemList } = await pollImageHistory(historyId, refreshToken, {
-      requestId,
-      modelName,
-      modelReqKey: model,
-      creditsBefore,
-      startedAt,
-    });
+    // 轮询到后台上限（默认 600 秒）或终态为止；超时不由这里定论，
+    // 由调用方（后台任务）转成 background_timeout outcome。
+    // 注意：这里的 -2011 不再记 timeout 事件——timeout 事件由
+    // generateImagesWithRetry 在“本次 HTTP 等待上限到”时记，
+    // background_timeout 事件由任务管理器在“后台跑满上限”时记，
+    // 避免同一个 -2011 被记两次、语义混淆。
+    const poll = await pollImageHistoryUntil(
+      historyId,
+      refreshToken,
+      {
+        requestId,
+        modelName,
+        modelReqKey: model,
+        creditsBefore,
+        startedAt,
+      },
+      {
+        deadlineMs: opts?.pollTimeoutMs ?? POLL_TIMEOUT_MS,
+        onStatus: opts?.onStatus,
+      }
+    );
+    if (poll.outcome === "unseen") {
+      throw new APIException(EX.API_IMAGE_GENERATION_FAILED, "记录不存在");
+    }
+    if (poll.outcome === "timeout") {
+      throw buildTimeoutError({
+        requestId,
+        modelName,
+        modelReqKey: model,
+        historyId,
+        elapsedMs: Date.now() - startedAt,
+        upstreamStatus: poll.status,
+        creditsBefore,
+        creditsAfter: await fetchCreditsSafe(refreshToken),
+      });
+    }
+    const { status, failCode, itemList } = poll;
     lastStatus = status;
     lastFailCode = failCode || null;
 
-    // 状态码说明（见 pollImageHistory）：
+    // 状态码说明（见 pollImageHistoryUntil）：
     // 20 排队 / 42、45 处理中 / 50、21 完成 / 30 失败
     const FAIL_STATE = 30;
     if (status === FAIL_STATE) {
@@ -898,8 +1057,23 @@ export async function generateImages(
 }
 
 /**
- * 带自动降级重试的图像生成
- * 如果积分不足，自动降低分辨率重试
+ * 带自动降级重试的图像生成（后台完成 + 指纹去重 + 结果缓存的入口）。
+ *
+ * 为什么这样包一层：应用型客户端（例如 Cherry Studio）超时后不会再调
+ * 恢复查询接口，所以超时处理必须放在反代内部——提交后轮询在后台独立跑，
+ * 不随本次 HTTP 连接断开而停止；结果按请求指纹缓存；客户端超时后重试
+ * 同一请求时，命中缓存或加入等待中的同一个任务，不再新建任务、不重复扣积分。
+ *
+ * 流程：
+ * 1. 先解析模型（未知模型直接报 -2000，不建任务、不扣积分）。
+ * 2. 按请求参数 + 账号标识算指纹，查后台任务表：
+ *    - 命中缓存 → 直接返回已完成的结果；
+ *    - 进行中 → 加入等待同一个任务；
+ *    - 上一个任务后台超时且 historyId 还在 → 对同一上游任务重新挂接轮询；
+ *    - 全新 → 提交新任务（后台跑到 BACKGROUND_TIMEOUT_MS）。
+ * 3. 本次 HTTP 只等 POLL_TIMEOUT_MS：等到了就返回结果；等不到就返回 -2011，
+ *    任务仍在后台跑，客户端重试同一请求即可拿到结果。
+ * 4. 积分不足时沿用旧行为：自动降分辨率重试。
  */
 export async function generateImagesWithRetry(
   _model: string,
@@ -937,53 +1111,285 @@ export async function generateImagesWithRetry(
     options.resolution,
     modelConfig
   );
-  let currentResIndex = Math.max(
-    0,
-    resolutionLevels.indexOf(resolutionLevels[0])
-  );
 
-  while (currentResIndex < resolutionLevels.length) {
-    try {
-      const currentOptions = {
-        ...options,
-        resolution: resolutionLevels[currentResIndex],
-      };
-      logger.info(`尝试生成图像，分辨率: ${currentOptions.resolution}`);
-      return await generateImages(_model, prompt, currentOptions, refreshToken);
-    } catch (error) {
-      // 检查是否为积分不足错误 (fail_code 2039/1006 或包含积分不足关键词)
-      const isInsufficientCredits =
-        error.code === EX.API_IMAGE_GENERATION_INSUFFICIENT_POINTS[0] ||
-        (error.message &&
-          (error.message.includes("积分不足") ||
-            error.message.includes("2039") ||
-            error.message.includes("1006")));
+  // 指纹：归一化后的请求参数 + 账号标识。
+  // seed 不参与指纹：seed 由服务端在提交时随机生成，第一次提交的 seed 决定
+  // 结果；重试命中同一指纹即复用第一次的结果，这正是去重的目的。
+  // 参考图按输入字符串哈希（base64 即内容哈希；本地路径/URL 按字符串哈希）。
+  const referenceInputs = [
+    ...new Set(
+      [options.filePath, ...(options.filePaths || [])].filter(
+        (value): value is string => typeof value === "string" && value.trim().length > 0
+      )
+    ),
+  ];
+  const fingerprint = computeImageFingerprint({
+    model: _model,
+    prompt,
+    negativePrompt: options.negativePrompt ?? "",
+    ratio: options.ratio ?? "1:1",
+    resolution: options.resolution ?? "2k",
+    n: options.n ?? 1,
+    sampleStrength: options.sampleStrength ?? 0.5,
+    referenceHashes: referenceInputs.map(hashReferenceInput),
+    accountHash: hashAccountToken(refreshToken),
+  });
 
-      if (
-        isInsufficientCredits &&
-        currentResIndex < resolutionLevels.length - 1
-      ) {
-        currentResIndex++;
-        logger.warn(
-          `积分不足，自动降级到 ${resolutionLevels[currentResIndex]} 分辨率重试...`
-        );
-        continue;
+  // 后台任务的执行体：沿用原有的分辨率降级重试链，但轮询跑到后台上限，
+  // 与本次 HTTP 等待解耦；所有错误都转成 outcome，由任务管理器收尾。
+  const runChain = async (job: GenerationJob): Promise<JobOutcome> => {
+    let currentResIndex = 0;
+    while (currentResIndex < resolutionLevels.length) {
+      try {
+        const currentOptions = {
+          ...options,
+          resolution: resolutionLevels[currentResIndex],
+        };
+        logger.info(`尝试生成图像，分辨率: ${currentOptions.resolution}`);
+        const urls = await generateImages(_model, prompt, currentOptions, refreshToken, {
+          pollTimeoutMs: BACKGROUND_TIMEOUT_MS,
+          onSubmitted: (info) => {
+            job.setHistoryId(info.historyId);
+            job.model = info.modelName;
+            job.modelReqKey = info.modelReqKey;
+            job.creditsBefore = info.creditsBefore;
+          },
+          onStatus: (status) => {
+            job.lastStatus = status;
+          },
+        });
+        return {
+          status: "succeeded",
+          urls,
+          historyId: job.historyId,
+          model: job.model,
+          modelReqKey: job.modelReqKey,
+          creditsBefore: job.creditsBefore,
+          elapsedMs: Date.now() - job.startedAt,
+        };
+      } catch (error) {
+        // 后台轮询跑满上限：不抛给调用方，转成 background_timeout outcome；
+        // 任务管理器会记 background_timeout 事件，historyId 保留供重挂接。
+        const isTimeout =
+          error instanceof APIException &&
+          error.compare(EX.API_IMAGE_GENERATION_TIMEOUT);
+        if (isTimeout) {
+          return {
+            status: "background_timeout",
+            historyId: job.historyId,
+            model: job.model,
+            modelReqKey: job.modelReqKey,
+            creditsBefore: job.creditsBefore,
+            creditsAfter: await fetchCreditsSafe(refreshToken),
+            elapsedMs: Date.now() - job.startedAt,
+            errorMessage: error.message,
+          };
+        }
+        // 检查是否为积分不足错误 (fail_code 2039/1006 或包含积分不足关键词)
+        const isInsufficientCredits =
+          error.code === EX.API_IMAGE_GENERATION_INSUFFICIENT_POINTS[0] ||
+          (error.message &&
+            (error.message.includes("积分不足") ||
+              error.message.includes("2039") ||
+              error.message.includes("1006")));
+
+        if (isInsufficientCredits && currentResIndex < resolutionLevels.length - 1) {
+          currentResIndex++;
+          logger.warn(
+            `积分不足，自动降级到 ${resolutionLevels[currentResIndex]} 分辨率重试...`
+          );
+          continue;
+        }
+
+        // 已是最低分辨率仍然积分不足
+        if (isInsufficientCredits) {
+          const insufficientError = new APIException(
+            EX.API_IMAGE_GENERATION_INSUFFICIENT_POINTS,
+            "积分不足，已自动降至最低画质仍然不足，请前往即梦官网 https://jimeng.jianying.com 充值积分"
+          );
+          return {
+            status: "failed",
+            error: insufficientError,
+            errorMessage: insufficientError.message,
+            historyId: job.historyId,
+          };
+        }
+
+        // 其他错误直接转成失败 outcome
+        return {
+          status: "failed",
+          error,
+          errorMessage: error instanceof Error ? error.message : String(error),
+          historyId: job.historyId,
+        };
       }
-
-      // 已是最低分辨率仍然失败
-      if (isInsufficientCredits) {
-        throw new APIException(
-          EX.API_IMAGE_GENERATION_INSUFFICIENT_POINTS,
-          "积分不足，已自动降至最低画质仍然不足，请前往即梦官网 https://jimeng.jianying.com 充值积分"
-        );
-      }
-
-      // 其他错误直接抛出
-      throw error;
     }
+    return {
+      status: "failed",
+      errorMessage: "图像生成失败",
+      historyId: job.historyId,
+    };
+  };
+
+  // 超时后重挂接：同一指纹的上一个任务已在后台跑满上限，但 historyId 还在，
+  // 不要重新提交（会新建任务、再次扣积分），改为对同一上游任务重新开始
+  // 后台轮询；上游若已完成，这次就能直接拿到图。
+  const existingJob = imageJobManager.peek(fingerprint);
+  let starter: (job: GenerationJob) => Promise<JobOutcome> = runChain;
+  if (existingJob?.status === "background_timeout" && existingJob.historyId) {
+    const historyId = existingJob.historyId;
+    const reattachModelReqKey = existingJob.modelReqKey;
+    starter = async (job) => {
+      job.setHistoryId(historyId);
+      job.model = existingJob.model;
+      job.modelReqKey = reattachModelReqKey;
+      job.creditsBefore = existingJob.creditsBefore;
+      const poll = await pollImageHistoryUntil(
+        historyId,
+        refreshToken,
+        {
+          requestId: retryRequestId,
+          modelName: _model,
+          modelReqKey: reattachModelReqKey || "",
+          creditsBefore: existingJob.creditsBefore ?? null,
+          startedAt: job.startedAt,
+        },
+        {
+          deadlineMs: BACKGROUND_TIMEOUT_MS,
+          onStatus: (status) => {
+            job.lastStatus = status;
+          },
+        }
+      );
+      if (poll.outcome === "unseen") {
+        return { status: "failed", errorMessage: "记录不存在", historyId };
+      }
+      if (poll.outcome === "timeout") {
+        return {
+          status: "background_timeout",
+          historyId,
+          model: job.model,
+          modelReqKey: job.modelReqKey,
+          creditsBefore: job.creditsBefore,
+          creditsAfter: await fetchCreditsSafe(refreshToken),
+          elapsedMs: Date.now() - job.startedAt,
+          errorMessage: "background poll timeout",
+        };
+      }
+      if (poll.status === 30) {
+        if (poll.failCode === "2038") {
+          const filteredError = new APIException(EX.API_CONTENT_FILTERED);
+          return {
+            status: "failed",
+            error: filteredError,
+            errorMessage: filteredError.message,
+            historyId,
+          };
+        }
+        return {
+          status: "failed",
+          errorMessage: `upstream fail_code=${poll.failCode}`,
+          historyId,
+        };
+      }
+      const urls = extractImageUrls(poll.itemList, options.n ?? 1);
+      const creditsAfter = await fetchCreditsSafe(refreshToken);
+      logGenerationEvent({
+        event: "success",
+        request_id: retryRequestId,
+        model: _model,
+        model_req_key: reattachModelReqKey,
+        history_id: historyId,
+        elapsed_ms: Date.now() - job.startedAt,
+        upstream_status: poll.status,
+        credits_before: existingJob.creditsBefore ?? null,
+        credits_after: creditsAfter,
+        result_count: urls.filter(Boolean).length,
+      });
+      return {
+        status: "succeeded",
+        urls,
+        historyId,
+        model: job.model,
+        modelReqKey: job.modelReqKey,
+        creditsBefore: job.creditsBefore,
+        creditsAfter,
+        elapsedMs: Date.now() - job.startedAt,
+      };
+    };
   }
 
-  throw new APIException(EX.API_IMAGE_GENERATION_FAILED, "图像生成失败");
+  const started = imageJobManager.getOrStart(fingerprint, starter, {
+    requestId: retryRequestId,
+    model: _model,
+  });
+  // cache_hit / dedup_join / background_busy 事件由任务管理器经 onEvent
+  // 统一记进结构化日志（见文件顶部接线），这里不再重复记。
+  if (started.rejected === "busy") {
+    throw new APIException(
+      EX.API_IMAGE_GENERATION_BUSY,
+      "后台生成任务已满，请稍后重试"
+    );
+  }
+  const job = started.job!;
+  if (started.hit === "cache") {
+    // 命中缓存：直接返回已完成的结果，未提交新任务、未扣积分
+    return job.outcome!.urls!;
+  }
+  if (started.hit === "reattach") {
+    logger.info(
+      `🔁 [去重] 指纹 ${fingerprint.slice(0, 12)}… 上一个后台任务已超时，重新挂接上游任务 ${job.historyId} 继续等（不重新提交、不重复扣积分）`
+    );
+  }
+
+  // 本次 HTTP 只等 POLL_TIMEOUT_MS；等不到就返回 -2011，任务仍在后台跑。
+  const { timedOut, outcome } = await imageJobManager.waitFor(job, POLL_TIMEOUT_MS);
+  if (!timedOut && outcome) {
+    if (outcome.status === "succeeded") return outcome.urls!;
+    if (outcome.status === "failed") {
+      throw (
+        outcome.error ??
+        new APIException(EX.API_IMAGE_GENERATION_FAILED, outcome.errorMessage || "图像生成失败")
+      );
+    }
+    // 后台跑满上限仍无结果（等待者恰好等到了这一刻）
+    throw buildTimeoutError({
+      requestId: retryRequestId,
+      modelName: _model,
+      modelReqKey: job.modelReqKey,
+      historyId: outcome.historyId ?? job.historyId,
+      elapsedMs: Date.now() - retryStartedAt,
+      upstreamStatus: job.lastStatus ?? null,
+      creditsBefore: job.creditsBefore ?? null,
+      creditsAfter: outcome.creditsAfter ?? null,
+    });
+  }
+
+  // 本次等待上限到了：记一条 timeout 事件，返回 -2011；任务继续在后台跑，
+  // 客户端重试同一请求时会命中缓存或加入等待。
+  const creditsAfter = await fetchCreditsSafe(refreshToken);
+  logGenerationEvent({
+    event: "timeout",
+    request_id: retryRequestId,
+    model: _model,
+    model_req_key: job.modelReqKey,
+    history_id: job.historyId,
+    elapsed_ms: Date.now() - retryStartedAt,
+    upstream_status: job.lastStatus ?? null,
+    credits_before: job.creditsBefore ?? null,
+    credits_after: creditsAfter,
+    error: "client wait timeout",
+  });
+  throw buildTimeoutError({
+    requestId: retryRequestId,
+    modelName: _model,
+    modelReqKey: job.modelReqKey,
+    historyId: job.historyId,
+    elapsedMs: Date.now() - retryStartedAt,
+    upstreamStatus: job.lastStatus ?? null,
+    creditsBefore: job.creditsBefore ?? null,
+    creditsAfter,
+  });
 }
 
 export default {
